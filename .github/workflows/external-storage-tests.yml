@@ -1,0 +1,28 @@
+name: External storage tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/Henge/ExternalDisk.swift'
+      - 'ios/Henge/FullDiskWriter.swift'
+      - 'tests/external-storage/**'
+      - '.github/workflows/external-storage-tests.yml'
+  pull_request:
+    paths:
+      - 'ios/Henge/**'
+      - 'tests/external-storage/**'
+permissions:
+  contents: read
+jobs:
+  storage-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/external-storage/run.sh
+      - name: Parse changed app Swift sources using the iOS SDK
+        run: |
+          xcrun --sdk iphoneos swiftc -frontend -parse \
+            ios/Henge/ExternalDisk.swift ios/Henge/FullDiskWriter.swift \
+            ios/Henge/Installer.swift ios/Henge/InstallView.swift \
+            ios/Henge/Machines.swift ios/Henge/SessionView.swift \
+            ios/Henge/HomeView.swift ios/Henge/MacSettingsView.swift
