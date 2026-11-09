@@ -15,7 +15,7 @@ permissions:
   contents: read
 jobs:
   storage-tests:
-    runs-on: macos-15
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/external-storage/run.sh
