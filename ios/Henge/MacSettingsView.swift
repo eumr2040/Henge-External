@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One Mac: what it has, and what can be done with it.
 struct MacSettingsView: View {
@@ -7,9 +8,12 @@ struct MacSettingsView: View {
     @State private var mac: VirtualMac
     @State private var confirmDelete = false
     @State private var movingExport = false
+    @State private var reconnecting = false
+    @State private var storageError: String?
     @AppStorage("henge.cpus") private var cpus = 4
 
     init(mac: VirtualMac) { _mac = State(initialValue: mac) }
+    private var installerOrVMRunning: Bool { Installer.shared.busy || henge_vm_state() == 1 }
 
     var body: some View {
         ScrollView {
@@ -88,6 +92,15 @@ struct MacSettingsView: View {
 
                 DeskHeading("Storage")
                 VStack(spacing: 11) {
+                    if let external = mac.externalDisk {
+                        Text("External USB: \(external.folder.name)")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("Reconnect the drive before Start. Removing this Mac from Henge keeps its external disk files.")
+                            .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                        Button("Reconnect / choose the same folder") { reconnecting = true }
+                            .disabled(installerOrVMRunning)
+                        if let storageError { Text(storageError).foregroundStyle(Desk.bad) }
+                    }
                     HStack {
                         Text("\(ByteText.string(UInt64(max(mac.bytesUsed, 0)))) used").font(.system(size: 16))
                         Spacer()
@@ -109,6 +122,18 @@ struct MacSettingsView: View {
         .navigationTitle(mac.name)
         .navigationBarTitleDisplayMode(.inline)
         .onDisappear(perform: save)
+        .fileImporter(isPresented: $reconnecting, allowedContentTypes: [.folder]) { result in
+            do {
+                guard var external = mac.externalDisk else { return }
+                external.folder = try ExternalDiskFolder.selected(result.get())
+                let access = try external.open() // validates the owner token AND exact disk size
+                defer { withExtendedLifetime(access) {} }
+                try JSONEncoder().encode(external).write(to: mac.directory.appendingPathComponent(ExternalDiskLocation.descriptor), options: .atomic)
+                mac.externalDisk = external
+                save()
+                storageError = nil
+            } catch { storageError = error.localizedDescription }
+        }
         .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
             switch result {
             case .success: machines.lastExport = nil
@@ -121,7 +146,7 @@ struct MacSettingsView: View {
                 dismiss()
             }
         } message: {
-            Text("Its disk is removed from this \(Device.name).")
+            Text(mac.externalDisk == nil ? "Its disk is removed from this \(Device.name)." : "This Mac is removed from Henge. Its external disk folder is kept on USB; no external files are deleted.")
         }
     }
 

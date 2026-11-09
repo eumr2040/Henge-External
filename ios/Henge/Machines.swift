@@ -18,12 +18,15 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     var screenHeight: Int?
     /// m4 fork: the iPad's own panel at Retina density. On by default on iPad, for Macs that never chose.
     var retina: Bool?
+    /// Only the large disk is external; ROM, identity, aux and RAM scratch remain internal.
+    var externalDisk: ExternalDiskLocation?
     var isRetina: Bool { Device.isPad && (retina ?? false) }
     var screen: (width: Int, height: Int) { isRetina ? Device.retinaScreen : (screenWidth ?? 1920, screenHeight ?? 1080) }
     var aspect: CGFloat { CGFloat(screen.width) / CGFloat(screen.height) }
 
     var directory: URL { Machines.directory(for: id) }
     var rom: URL { directory.appendingPathComponent("AVPBooter.vmapple2.bin") }
+    /// Internal/imported disks only. Engine and export callers must use openDisk().
     var disk: URL { directory.appendingPathComponent("disk.img") }
     var aux: URL { directory.appendingPathComponent("auxiliary.bin") }
 }
@@ -100,6 +103,21 @@ final class Machines: ObservableObject {
         let items = (try? fm.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []
         for item in items {
             guard let id = UUID(uuidString: item.lastPathComponent), !known.contains(id) else { continue }
+            // An interrupted external install retains the local descriptor for recovery.
+            // Never infer that an unplugged drive means its Mac should be deleted.
+            if fm.fileExists(atPath: item.appendingPathComponent(ExternalDiskLocation.descriptor).path) {
+                if !fm.fileExists(atPath: item.appendingPathComponent("external-detached").path),
+                   fm.fileExists(atPath: item.appendingPathComponent(Self.installedMarker).path),
+                   let data = try? Data(contentsOf: item.appendingPathComponent("pending-machine.json")),
+                   let recovered = try? JSONDecoder().decode(VirtualMac.self, from: data),
+                   recovered.id == id, recovered.externalDisk?.machineID == id {
+                    all.append(recovered)
+                    save()
+                    HengeLog.log("machines", "recovered completed external machine \(id)")
+                }
+                HengeLog.log("machines", "kept external machine descriptor \(id); no automatic deletion")
+                continue
+            }
             let marker = item.appendingPathComponent(Self.installedMarker)
             if fm.fileExists(atPath: marker.path), let data = try? Data(contentsOf: item.appendingPathComponent("machine.json")),
                let info = try? JSONDecoder().decode(MachineFile.self, from: data),
@@ -218,6 +236,8 @@ final class Machines: ObservableObject {
     }
 
     private func writeExport(_ mac: VirtualMac) async throws -> URL {
+        let diskAccess = try mac.openDisk()
+        defer { withExtendedLifetime(diskAccess) {} }
         let fm = FileManager.default
         let exports = Self.inbox.appendingPathComponent("Exports", isDirectory: true)
         let safeName = mac.name.replacingOccurrences(of: "/", with: "-")
@@ -226,7 +246,7 @@ final class Machines: ObservableObject {
         let partial = exports.appendingPathComponent(safeName + ".partial", isDirectory: true)
         try? fm.removeItem(at: partial)
         try? fm.removeItem(at: final)
-        let used = (try? mac.disk.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
+        let used = (try? diskAccess.url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
         let free = (try? Self.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage ?? 0
         let needed = Int64(used) + (256 << 20)
         if free > 0 && free < needed {
@@ -238,7 +258,7 @@ final class Machines: ObservableObject {
             try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
             let info: [String: Any] = ["name": mac.name, "ecid": mac.ecid, "seed": mac.seed, "ramMB": mac.ramMB]
             try JSONSerialization.data(withJSONObject: info).write(to: partial.appendingPathComponent("machine.json"))
-            let source = mac.disk.path, target = partial.appendingPathComponent(Self.packedDisk).path
+            let source = diskAccess.url.path, target = partial.appendingPathComponent(Self.packedDisk).path
             let ok = await Task.detached { () -> Bool in
                 hv_sparse_pack_progress(source, target, { done, total, _ in
                     let fraction = Double(done) / Double(max(total, 1))
@@ -269,7 +289,14 @@ final class Machines: ObservableObject {
     }
 
     func delete(_ id: UUID) {
-        try? FileManager.default.removeItem(at: Self.directory(for: id))
+        // External files deliberately remain on USB. Removing a Mac never erases that drive.
+        if all.first(where: { $0.id == id })?.externalDisk != nil {
+            // Keep the small local identity/aux too: disk.img alone is not a recoverable Mac.
+            do { try Data().write(to: Self.directory(for: id).appendingPathComponent("external-detached"), options: .atomic) }
+            catch { lastError = error.localizedDescription; return }
+        } else {
+            try? FileManager.default.removeItem(at: Self.directory(for: id))
+        }
         all.removeAll { $0.id == id }
         save()
     }
@@ -296,7 +323,7 @@ final class Machines: ObservableObject {
             HengeLog.log("machines", "machines.json (\(data.count) bytes) could not be read")
             return
         }
-        all = list.filter { FileManager.default.fileExists(atPath: $0.disk.path) }
+        all = list.filter { $0.externalDisk != nil || FileManager.default.fileExists(atPath: $0.disk.path) }
     }
 
     private func save() {

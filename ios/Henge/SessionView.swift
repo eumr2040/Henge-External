@@ -545,6 +545,18 @@ struct SessionView: View {
     }
 
     private func run() async {
+        guard henge_vm_state() == 0 else {
+            error = "Quit and reopen Henge before starting another Mac."
+            return
+        }
+        let diskAccess: DiskAccess
+        do {
+            diskAccess = try mac.openDisk()
+        } catch {
+            self.error = error.localizedDescription
+            return
+        }
+        ExternalDiskRuntime.retain(diskAccess)
         let ram = GuestMemory.prepare(mac)
         HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
         guard ram >= 1024 else {
@@ -554,6 +566,7 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         Sharing.prepare()
         EngineTuning.apply()
+        ExternalDiskRuntime.tune(for: mac)
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {
             henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
@@ -561,7 +574,7 @@ struct SessionView: View {
             henge_vm_set_display_mm(0, 0)
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
-        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
+        let rc = henge_vm_boot(mac.rom.path, diskAccess.url.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
             return
@@ -575,6 +588,14 @@ struct SessionView: View {
         var lastGPUFrames = henge_vm_gpu_frames()
         var tick = 0
         while !Task.isCancelled {
+            if mac.externalDisk != nil {
+                do { try diskAccess.validate() }
+                catch {
+                    henge_vm_stop()
+                    self.error = "External disk access was lost. The VM was asked to stop. Reconnect the drive, then quit and reopen Henge."
+                    break
+                }
+            }
             state = henge_vm_state()
             cpusOn = henge_vm_cpus_on()
             userCode = userCode || henge_vm_guest_el0() != 0

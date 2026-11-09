@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Download macOS (or use a copy already on this device) and install it on a new Mac.
 struct InstallView: View {
@@ -8,7 +9,11 @@ struct InstallView: View {
     @StateObject private var display = DisplayRouter()
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
-    @State private var ramGB = Device.suggestedRAMGB
+    @State private var ramGB = ProcessInfo.processInfo.physicalMemory <= (UInt64(4) << 30) ? 2 : Device.suggestedRAMGB
+    @State private var useExternal = true
+    @State private var externalFolder: ExternalDiskFolder?
+    @State private var pickingExternal = false
+    @State private var externalError: String?
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @State private var details = false
@@ -34,6 +39,12 @@ struct InstallView: View {
             }
             .background(Desk.page)
             .navigationTitle(installer.busy ? "Installing" : "Install macOS")
+            .fileImporter(isPresented: $pickingExternal, allowedContentTypes: [.folder]) { result in
+                do {
+                    externalFolder = try ExternalDiskFolder.selected(result.get())
+                    externalError = nil
+                } catch { externalError = error.localizedDescription }
+            }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
                     jitReady = JITBootstrap.ready
@@ -115,13 +126,29 @@ struct InstallView: View {
         }
         .deskCard()
 
-        Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
-            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
+        DeskHeading("Disk location")
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle("External USB drive (experimental)", isOn: $useExternal)
+            if useExternal {
+                Button(externalFolder.map { "Folder: \($0.name) — choose again" } ?? "Choose folder on USB drive") { pickingExternal = true }
+                Text("A new 64 GiB disk is fully written to the chosen drive. On exFAT this uses about 69 GB immediately and may take many minutes. Keep the drive connected throughout installation and use.")
+                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                Text("The download, restore cache and temporary guest memory still use internal iPad storage. This does not confirm macOS will boot on a 4 GB iPad.")
+                    .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                if let externalError { Text(externalError).foregroundStyle(Desk.bad) }
+            }
         }
-        .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld))
-        .disabled(!jitReady || Device.chipTooOld)
+        .padding(17)
+        .deskCard()
+
+        Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
+            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter,
+                            externalFolder: useExternal ? externalFolder : nil)
+        }
+        .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld && (!useExternal || externalFolder != nil)))
+        .disabled(!jitReady || Device.chipTooOld || (useExternal && externalFolder == nil))
         .padding(.top, 20)
-        Text(Device.chipTooOld ? Device.chipTooOldText : jitReady ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
+        Text(Device.chipTooOld ? Device.chipTooOldText : jitReady ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release, external: useExternal, ramMB: ramGB * 1024)))) free internally\(useExternal ? ", plus 66 GiB on USB" : "")."
                                 : JITBootstrap.lastFailure ?? "Turn on JIT first. \(jit.automaticDescription)")
             .font(.system(size: 13))
             .foregroundStyle(Desk.dim)
@@ -173,6 +200,7 @@ struct InstallView: View {
     }
 
     private var fraction: Double {
+        if case .preparing = installer.phase { return installer.diskPrepared }
         if case .downloading = installer.phase {
             return installer.expected > 0 ? Double(installer.received) / Double(installer.expected) : 0
         }
@@ -188,6 +216,10 @@ struct InstallView: View {
     }
 
     @ViewBuilder private var progress: some View {
+        if case .preparing = installer.phase, useExternal {
+            Text("Preparing the external disk (64 GiB). This can take many minutes on a USB hard drive.")
+                .font(.system(size: 15)).foregroundStyle(Desk.dim).padding(.bottom, 12)
+        }
         Text("\(release.name) on this \(Device.name). Keep Henge open.")
             .font(.system(size: 16))
             .foregroundStyle(Desk.dim)

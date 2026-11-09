@@ -77,6 +77,9 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
    host runs; 2 fcntl(F_BARRIERFSYNC). */
 int hv_disk_flush(HvDisk *d) {
     if (d->readonly) return 0;
+    /* USB/exFAT mode always honours a guest flush with fsync, even if faster flush
+       was selected in Settings. It cannot make surprise unplugging safe. */
+    if (getenv("HV_EXTERNAL_DISK")) return fsync(d->fd);
     switch (hv_knob[HV_K_FLUSH]) {
     case 1: return 0;
     case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;

@@ -131,7 +131,9 @@ struct HomeView: View {
 
 extension VirtualMac {
     var bytesUsed: Int64 {
-        Int64((try? disk.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0)
+        guard let access = try? openDisk() else { return externalDisk == nil ? 0 : diskBytes }
+        defer { withExtendedLifetime(access) {} }
+        return Int64((try? access.url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? (externalDisk == nil ? 0 : Int(diskBytes)))
     }
 
     var lastUsedText: String {

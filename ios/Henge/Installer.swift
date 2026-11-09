@@ -46,6 +46,7 @@ final class Installer: NSObject, ObservableObject {
     @Published private(set) var step: Int = 0
     @Published private(set) var stepProgress: Double = 0
     @Published private(set) var machineName = ""
+    @Published private(set) var diskPrepared: Double = 0
 
     private var session: URLSession?
     /* Background time, so a moment out of the foreground (a notification, iPhone Mirroring reconnecting)
@@ -77,7 +78,11 @@ final class Installer: NSObject, ObservableObject {
     static func deleteImage(_ r: MacOSRelease) { try? FileManager.default.removeItem(at: imagePath(r)) }
 
     /// Free space an install takes: the new Mac's disk, and the download if it is not here yet.
-    static func spaceNeeded(_ r: MacOSRelease) -> Int64 { (haveImage(r) ? 0 : r.bytes) + newMacBytes }
+    static func spaceNeeded(_ r: MacOSRelease, external: Bool = false, ramMB: Int = 2048) -> Int64 {
+        // External mode still needs internal download, restore cache and file-backed guest RAM.
+        // Reserve up to another IPSW's size for extraction; this is an estimate, not a quota.
+        (haveImage(r) ? 0 : r.bytes) + (external ? r.bytes + Int64(max(ramMB, 2048)) * (1 << 20) + (2 << 30) : newMacBytes)
+    }
     private static let newMacBytes: Int64 = 24 << 30
 
     func reset() { if !busy { phase = .idle } }
@@ -88,8 +93,12 @@ final class Installer: NSObject, ObservableObject {
         grace = .invalid
     }
 
-    func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool) {
+    func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool,
+               externalFolder: ExternalDiskFolder? = nil) {
         guard !busy else { return }
+        // Set synchronously, before the Task starts; a second tap must not start a second install.
+        phase = .preparing
+        diskPrepared = 0
         machineName = name
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
         grace = UIApplication.shared.beginBackgroundTask(withName: "Henge install") {
@@ -99,13 +108,18 @@ final class Installer: NSObject, ObservableObject {
             defer { UIApplication.shared.isIdleTimerDisabled = false; endGrace() }
             var made: VirtualMac?
             do {
-                try checkSpace(release)
+                guard JITBootstrap.ready else { throw message("Turn on JIT before installing.") }
+                guard henge_vm_state() == 0 else { throw message("Quit and reopen Henge before installing another Mac.") }
+                try checkSpace(release, externalFolder: externalFolder, ramMB: ramMB)
                 let rom = try await BootROM.file() // before the long download, so a problem shows up at once
                 HengeLog.log("install", "boot ROM ready")
                 let ipsw = try await download(release)
                 phase = .preparing
-                var mac = try prepare(name: name, ramMB: ramMB, rom: rom)
+                var mac = try await prepare(name: name, ramMB: ramMB, rom: rom, externalFolder: externalFolder)
                 mac.osName = release.name
+                if mac.externalDisk != nil {
+                    try JSONEncoder().encode(mac).write(to: mac.directory.appendingPathComponent("pending-machine.json"), options: .atomic)
+                }
                 made = mac
                 phase = .installing
                 try await install(mac, ipsw: ipsw, cpus: cpus)
@@ -114,17 +128,27 @@ final class Installer: NSObject, ObservableObject {
                 phase = .done("\(release.name) is installed on \(name). Quit Henge (swipe it away) and open it again, then tap Start.")
             } catch {
                 HengeLog.log("install", "failed: \(error.localizedDescription)")
+                if made != nil, henge_vm_state() == 1 { henge_vm_stop() }
                 // A half-installed Mac is no use, and its disk can be many gigabytes. The download stays.
-                if let made, henge_vm_state() != 1 { try? FileManager.default.removeItem(at: made.directory) }
+                if let made, made.externalDisk == nil, henge_vm_state() != 1 { try? FileManager.default.removeItem(at: made.directory) }
                 phase = .failed(error.localizedDescription)
             }
         }
     }
 
-    private func checkSpace(_ r: MacOSRelease) throws {
+    private func checkSpace(_ r: MacOSRelease, externalFolder: ExternalDiskFolder?, ramMB: Int) throws {
         let free = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
-        let needed = Self.spaceNeeded(r)
+        let needed = Self.spaceNeeded(r, external: externalFolder != nil, ramMB: ramMB)
+        if let externalFolder {
+            let scope = try externalFolder.open()
+            defer { withExtendedLifetime(scope) {} }
+            let values = try scope.url.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+            guard let available = values.volumeAvailableCapacity, Int64(available) >= (66 << 30) else {
+                throw message("External storage needs at least 66 GiB free for the fully allocated 64 GiB disk and reserve.")
+            }
+            guard free > 0 else { throw message("Cannot measure internal free space. Installation was not started.") }
+        }
         if free > 0 && free < needed {
             throw message("This install needs about \(ByteText.string(UInt64(needed))) free; this \(Device.name) has \(ByteText.string(UInt64(free))).")
         }
@@ -173,20 +197,38 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The new machine
 
-    private func prepare(name: String, ramMB: Int, rom: URL) throws -> VirtualMac {
+    private func prepare(name: String, ramMB: Int, rom: URL, externalFolder: ExternalDiskFolder?) async throws -> VirtualMac {
         // A new machine identity, as VZMacMachineIdentifier makes one: a random ECID.
         let ecid = UInt64.random(in: 1 << 40 ..< 1 << 62)
         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
+        if let externalFolder {
+            mac.externalDisk = ExternalDiskLocation(folder: externalFolder, machineID: mac.id, token: UUID(), bytes: UInt64(64) << 30)
+        }
         (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
         let fm = FileManager.default
         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
         Machines.excludeFromBackup(Machines.root)
         try? fm.removeItem(at: mac.rom)
         try fm.copyItem(at: rom, to: mac.rom)
-        guard fm.createFile(atPath: mac.disk.path, contents: nil) else { throw message("Cannot create the disk.") }
-        let h = try FileHandle(forWritingTo: mac.disk)
-        try h.truncate(atOffset: UInt64(64) << 30) // sparse: blocks are only used as macOS writes them
-        try h.close()
+        if let external = mac.externalDisk {
+            // Persist before slow USB writes so a crash cannot make cleanup discard the association.
+            try JSONEncoder().encode(external).write(to: mac.directory.appendingPathComponent(ExternalDiskLocation.descriptor), options: .atomic)
+            let location = external
+            let worker = Task.detached(priority: .utility) {
+                let access = try location.createDirectory()
+                defer { withExtendedLifetime(access) {} }
+                try FullDiskWriter.create(at: access.url, bytes: location.bytes, cancelled: { Task.isCancelled }) { done, total in
+                    Task { @MainActor in Installer.shared.diskPrepared = Double(done) / Double(total) }
+                }
+                try access.validate()
+            }
+            try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+        } else {
+            guard fm.createFile(atPath: mac.disk.path, contents: nil) else { throw message("Cannot create the disk.") }
+            let h = try FileHandle(forWritingTo: mac.disk)
+            try h.truncate(atOffset: UInt64(64) << 30) // internal APFS sparse disk
+            try h.close()
+        }
         guard henge_make_aux(mac.aux.path) == 0 else { throw message("Cannot create the auxiliary storage.") }
         let info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB]
         try JSONSerialization.data(withJSONObject: info).write(to: mac.directory.appendingPathComponent("machine.json"))
@@ -199,6 +241,9 @@ final class Installer: NSObject, ObservableObject {
 
     private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
+        let diskAccess = try mac.openDisk()
+        ExternalDiskRuntime.retain(diskAccess)
+        ExternalDiskRuntime.tune(for: mac)
         // The restore needs 2 GB, whatever the Mac is set to use afterwards, and gets at most 4 GB: the restore system
         // caches the ~15 GB it writes, so it fills all the memory it is given, and 10 GB of a 12 GB iPhone's RAM in use
         // (it is outside Henge's footprint, so iOS does not stop it) stalls the whole phone two thirds of the way through.
@@ -210,11 +255,18 @@ final class Installer: NSObject, ObservableObject {
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         var buffer = [CChar](repeating: 0, count: 256)
-        let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
+        let rc = henge_vm_install(mac.rom.path, diskAccess.url.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)
         if rc != 0 { throw message(String(cString: buffer)) }
         while true {
             try await Task.sleep(nanoseconds: 1_000_000_000)
+            if mac.externalDisk != nil {
+                do { try diskAccess.validate() }
+                catch {
+                    henge_vm_stop()
+                    throw message("External disk access was lost. The VM was asked to stop. Reconnect the drive and inspect the log; disk integrity is not guaranteed.")
+                }
+            }
             step = Int(henge_install_step())
             stepProgress = henge_install_progress()
             if step == 100 { break }
