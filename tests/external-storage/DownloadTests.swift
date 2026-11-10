@@ -30,7 +30,10 @@ struct DownloadTests {
         do { _ = try await fetch(drop) } catch { interrupted = true }
         try check(interrupted && drop.completeSize == nil, "Interrupted HTTP response was accepted")
         let partial = try drop.resumeState()
-        try check(partial.offset == 65536, "Interrupted body was not retained for resuming")
+        try FileHandle.standardError.write(contentsOf: Data("Interrupted HTTP: retained \(partial.offset) bytes; partial size \(partial.partialSize ?? -1)\n".utf8))
+        try check(partial.offset > 0 && partial.offset <= 65536, "Interrupted body was not retained for resuming")
+        let retained = try Data(contentsOf: drop.partial)
+        try check(retained == expected.prefix(Int(partial.offset)), "Interrupted partial contains wrong bytes")
         let resumedURL = try await fetch(drop)
         let resumedData = try Data(contentsOf: resumedURL)
         try check(resumedData == expected, "Real HTTP Range/If-Range resume corrupted bytes")

@@ -3,6 +3,7 @@ import http.server
 import pathlib
 import socket
 import sys
+import time
 
 BODY = bytes(i % 251 for i in range(1 << 20))
 ETAG = '"henge-fixture-v1"'
@@ -40,6 +41,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/drop" and not requested:
             self.wfile.write(BODY[:65536])
             self.wfile.flush()
+            # Give the client an observable body before deliberately dropping TCP.
+            # An immediate close can fail before URLSession delivers response callbacks.
+            time.sleep(0.2)
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
