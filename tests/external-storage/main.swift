@@ -94,4 +94,128 @@ try test("Bookmark and machine ownership survive serialization") {
     let decoded = try JSONDecoder().decode(ExternalDiskLocation.self, from: JSONEncoder().encode(location))
     try check(decoded == location && !decoded.directoryName.contains("/"), "disk identity changed")
 }
+
+let source = URL(string: "https://example.test/restore.ipsw")!
+func imageStore(_ name: String) -> RestoreImageStore {
+    RestoreImageStore(url: root.appendingPathComponent(name + ".ipsw"), source: source)
+}
+func http(_ status: Int, _ headers: [String: String]) -> HTTPURLResponse {
+    HTTPURLResponse(url: source, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
+}
+
+try test("An interrupted restore download cannot look complete") {
+    let store = imageStore("interrupted")
+    let file = try store.openForResponse(bytes: 16, validator: "\"first\"", offset: 0)
+    try file.write(contentsOf: Data([1, 2, 3, 4]))
+    try file.close()
+    try check(store.completeSize == nil, "partial reported complete")
+    let state = try store.resumeState()
+    try check(state.offset == 4 && state.metadata?.bytes == 16, "resume lost the partial size")
+    try mustThrow { try store.publish(bytes: 16, validator: "\"first\"") }
+}
+try test("A matching range appends and publishes the exact complete image") {
+    let store = imageStore("interrupted")
+    let state = try store.resumeState()
+    let response = try RestoreDownloadResponse.parse(http(206, ["Content-Range": "bytes 4-15/16", "Content-Length": "12", "ETag": "\"first\""]),
+                                                     requestedOffset: state.offset, previous: state.metadata)
+    let file = try store.openForResponse(bytes: response.bytes, validator: response.validator, offset: response.offset,
+                                         expectedPartialSize: state.partialSize)
+    try file.write(contentsOf: Data(repeating: 5, count: 12))
+    try file.synchronize()
+    try file.close()
+    try store.publish(bytes: response.bytes, validator: response.validator)
+    try check(store.completeSize == 16, "completion receipt missing")
+    let bytes = try Data(contentsOf: store.url)
+    try check(bytes == Data([1, 2, 3, 4]) + Data(repeating: 5, count: 12), "resumed bytes wrong")
+    try check(!fm.fileExists(atPath: store.partial.path), "partial remained after publication")
+}
+try test("A server ignoring Range restarts instead of appending") {
+    let store = imageStore("range-ignored")
+    var file = try store.openForResponse(bytes: 10, validator: "\"old\"", offset: 0)
+    try file.write(contentsOf: Data(repeating: 9, count: 6))
+    try file.close()
+    let state = try store.resumeState()
+    let response = try RestoreDownloadResponse.parse(http(200, ["Content-Length": "3", "ETag": "\"new\""]),
+                                                     requestedOffset: state.offset, previous: state.metadata)
+    try check(response.offset == 0 && response.bytes == 3, "ignored range was appended")
+    file = try store.openForResponse(bytes: response.bytes, validator: response.validator, offset: response.offset,
+                                     expectedPartialSize: state.partialSize)
+    try file.write(contentsOf: Data([1, 2, 3]))
+    try file.close()
+    try store.publish(bytes: 3, validator: response.validator)
+    let bytes = try Data(contentsOf: store.url)
+    try check(bytes == Data([1, 2, 3]), "old trailing bytes remained")
+}
+try test("Wrong ranges, changed validators and encoded bodies are rejected") {
+    let old = RestoreImageStore.Metadata(source: source.absoluteString, bytes: 16, validator: "\"one\"")
+    let bad = [
+        http(206, ["Content-Range": "bytes 3-15/16", "Content-Length": "13", "ETag": "\"one\""]),
+        http(206, ["Content-Range": "bytes 4-15/16", "Content-Length": "12", "ETag": "\"two\""]),
+        http(206, ["Content-Range": "bytes 4-16/17", "Content-Length": "13", "ETag": "\"one\""]),
+        http(200, ["Content-Length": "16", "Content-Encoding": "gzip"]),
+        http(404, ["Content-Length": "16"]),
+        http(200, [:])
+    ]
+    for response in bad {
+        try mustThrow { _ = try RestoreDownloadResponse.parse(response, requestedOffset: 4, previous: old) }
+    }
+}
+try test("Unverified existing images and foreign partials are preserved") {
+    let store = imageStore("foreign")
+    let bytes = Data("USER FILE".utf8)
+    try bytes.write(to: store.url)
+    try check(store.completeSize == nil, "unverified image treated as downloaded")
+    try mustThrow { _ = try store.resumeState() }
+    try mustThrow { try store.removeCompletedImage() }
+    let after = try Data(contentsOf: store.url)
+    try check(after == bytes, "existing image changed")
+    let partial = imageStore("foreign-partial")
+    try bytes.write(to: partial.partial)
+    try mustThrow { _ = try partial.resumeState() }
+    let partialAfter = try Data(contentsOf: partial.partial)
+    try check(partialAfter == bytes, "foreign partial changed")
+}
+try test("A download receipt from another source is not accepted") {
+    let store = imageStore("interrupted")
+    let foreign = RestoreImageStore(url: store.url, source: URL(string: "https://example.test/other.ipsw")!)
+    try check(foreign.completeSize == nil, "foreign source accepted")
+}
+try test("Completed downloads can be deleted without deleting other files") {
+    let store = imageStore("range-ignored")
+    try store.removeCompletedImage()
+    try check(!fm.fileExists(atPath: store.url.path), "complete image not deleted")
+    let other = imageStore("foreign")
+    try check(fm.fileExists(atPath: other.url.path), "unrelated file deleted")
+}
+try test("A publication race cannot replace an existing final image") {
+    let store = imageStore("download-race")
+    let file = try store.openForResponse(bytes: 3, validator: nil, offset: 0)
+    try file.write(contentsOf: Data([1, 2, 3]))
+    try file.close()
+    let other = Data([7, 8, 9]) // same length: a failed publish must not certify it
+    try other.write(to: store.url)
+    try mustThrow { try store.publish(bytes: 3, validator: nil) }
+    let after = try Data(contentsOf: store.url)
+    try check(after == other, "concurrent final image was overwritten")
+    try check(store.completeSize == nil, "race incorrectly certified someone else's image")
+}
+try test("A concurrently created partial is not overwritten") {
+    let store = imageStore("partial-race")
+    let other = Data([7, 8, 9])
+    try other.write(to: store.partial)
+    try mustThrow { _ = try store.openForResponse(bytes: 8, validator: nil, offset: 0) }
+    let after = try Data(contentsOf: store.partial)
+    try check(after == other, "concurrent partial was overwritten")
+}
+try test("USB installs reserve internal RAM without staging the IPSW internally") {
+    let ipsw: Int64 = 16_035 << 20
+    let internalNeed = InstallSpace.internalBytes(imageBytes: ipsw, haveImage: false, external: true, ramMB: 2048)
+    try check(internalNeed == 4 << 30, "external install still stages IPSW internally")
+    try check(internalNeed < 7 << 30, "does not fit the user's internal free-space budget")
+    try check(InstallSpace.internalBytes(imageBytes: ipsw, haveImage: true, external: true, ramMB: 2048) == internalNeed,
+              "USB download cache affects internal-space estimate")
+    let usbNeed = InstallSpace.externalBytes(imageBytes: ipsw, haveImage: false)
+    try check(usbNeed > 64 << 30 && usbNeed < 292_000_000_000, "USB space estimate does not include staging or exceeds this drive")
+    try check(InstallSpace.externalBytes(imageBytes: ipsw, haveImage: true) == usbNeed - ipsw, "completed cache not reused in estimate")
+}
 print("\(passed) storage tests passed. USB permissions, exFAT, iOS build and macOS boot are NOT covered.")

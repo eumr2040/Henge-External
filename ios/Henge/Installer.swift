@@ -79,11 +79,12 @@ final class Installer: NSObject, ObservableObject {
 
     /// Free space an install takes: the new Mac's disk, and the download if it is not here yet.
     static func spaceNeeded(_ r: MacOSRelease, external: Bool = false, ramMB: Int = 2048) -> Int64 {
-        // External mode still needs internal download, restore cache and file-backed guest RAM.
-        // Reserve up to another IPSW's size for extraction; this is an estimate, not a quota.
-        (haveImage(r) ? 0 : r.bytes) + (external ? r.bytes + Int64(max(ramMB, 2048)) * (1 << 20) + (2 << 30) : newMacBytes)
+        InstallSpace.internalBytes(imageBytes: r.bytes, haveImage: haveImage(r), external: external, ramMB: ramMB)
     }
-    private static let newMacBytes: Int64 = 24 << 30
+
+    static func externalSpaceNeeded(_ r: MacOSRelease) -> Int64 {
+        InstallSpace.externalBytes(imageBytes: r.bytes, haveImage: haveImage(r))
+    }
 
     func reset() { if !busy { phase = .idle } }
 
@@ -110,10 +111,11 @@ final class Installer: NSObject, ObservableObject {
             do {
                 guard JITBootstrap.ready else { throw message("Turn on JIT before installing.") }
                 guard henge_vm_state() == 0 else { throw message("Quit and reopen Henge before installing another Mac.") }
-                try checkSpace(release, externalFolder: externalFolder, ramMB: ramMB)
+                let workspace = try externalFolder.map { try ExternalInstallWorkspace(folder: $0) }
+                try checkSpace(release, workspace: workspace, ramMB: ramMB)
                 let rom = try await BootROM.file() // before the long download, so a problem shows up at once
                 HengeLog.log("install", "boot ROM ready")
-                let ipsw = try await download(release)
+                let ipsw = try await download(release, workspace: workspace)
                 phase = .preparing
                 var mac = try await prepare(name: name, ramMB: ramMB, rom: rom, externalFolder: externalFolder)
                 mac.osName = release.name
@@ -122,8 +124,12 @@ final class Installer: NSObject, ObservableObject {
                 }
                 made = mac
                 phase = .installing
-                try await install(mac, ipsw: ipsw, cpus: cpus)
-                if !keepImage { try? FileManager.default.removeItem(at: ipsw) }
+                try await install(mac, ipsw: ipsw, cpus: cpus, workspace: workspace)
+                if !keepImage {
+                    if let workspace, ipsw != Self.imagePath(release) {
+                        try? workspace.image(id: release.id, source: release.url).removeCompletedImage()
+                    } else { try? FileManager.default.removeItem(at: ipsw) }
+                }
                 HengeLog.log("install", "\(name): installed \(release.name)")
                 phase = .done("\(release.name) is installed on \(name). Quit Henge (swipe it away) and open it again, then tap Start.")
             } catch {
@@ -136,16 +142,18 @@ final class Installer: NSObject, ObservableObject {
         }
     }
 
-    private func checkSpace(_ r: MacOSRelease, externalFolder: ExternalDiskFolder?, ramMB: Int) throws {
+    private func checkSpace(_ r: MacOSRelease, workspace: ExternalInstallWorkspace?, ramMB: Int) throws {
         let free = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
-        let needed = Self.spaceNeeded(r, external: externalFolder != nil, ramMB: ramMB)
-        if let externalFolder {
-            let scope = try externalFolder.open()
-            defer { withExtendedLifetime(scope) {} }
-            let values = try scope.url.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-            guard let available = values.volumeAvailableCapacity, Int64(available) >= (66 << 30) else {
-                throw message("External storage needs at least 66 GiB free for the fully allocated 64 GiB disk and reserve.")
+        let needed = Self.spaceNeeded(r, external: workspace != nil, ramMB: ramMB)
+        if let workspace {
+            try workspace.validate()
+            let cachedSize = try workspace.image(id: r.id, source: r.url).completeSize
+            let haveImage = Self.haveImage(r) || cachedSize != nil
+            let externalNeeded = InstallSpace.externalBytes(imageBytes: r.bytes, haveImage: haveImage)
+            let values = try workspace.directory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+            guard let available = values.volumeAvailableCapacity, Int64(available) >= externalNeeded else {
+                throw message("External storage needs about \(ByteText.string(UInt64(externalNeeded))) free for the 64 GiB disk, restore download, extracted files and reserve.")
             }
             guard free > 0 else { throw message("Cannot measure internal free space. Installation was not started.") }
         }
@@ -156,7 +164,12 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: Download
 
-    private func download(_ r: MacOSRelease) async throws -> URL {
+    private func download(_ r: MacOSRelease, workspace: ExternalInstallWorkspace?) async throws -> URL {
+        if let workspace {
+            // Existing internal images can be read in place, without copying 16+ GB to USB.
+            if Self.haveImage(r) { return Self.imagePath(r) }
+            return try await downloadToUSB(r, workspace: workspace)
+        }
         let dest = Self.imagePath(r)
         try FileManager.default.createDirectory(at: Self.imageDirectory, withIntermediateDirectories: true)
         Machines.excludeFromBackup(Self.imageDirectory)
@@ -179,6 +192,41 @@ final class Installer: NSObject, ObservableObject {
             }
         }
         throw message("The download kept failing.")
+    }
+
+    private func downloadToUSB(_ r: MacOSRelease, workspace: ExternalInstallWorkspace) async throws -> URL {
+        let store = try workspace.image(id: r.id, source: r.url)
+        if let size = store.completeSize {
+            guard size > r.bytes / 2 else { throw message("The cached USB restore image is much smaller than expected. It was not used.") }
+            received = size
+            expected = size
+            return store.url
+        }
+        phase = .downloading
+        received = 0
+        expected = r.bytes
+        HengeLog.log("install", "streaming restore image directly to USB: \(r.id)")
+        for attempt in 1...20 {
+            try workspace.validate()
+            do {
+                let downloader = RestoreImageDownload(store: store) { received, expected in
+                    Task { @MainActor in
+                        Installer.shared.received = received
+                        Installer.shared.expected = expected
+                    }
+                }
+                let url = try await downloader.start()
+                try workspace.validate()
+                guard (store.completeSize ?? 0) > r.bytes / 2 else {
+                    throw message("The USB restore download is much smaller than expected. It was not used.")
+                }
+                return url
+            } catch let error as URLError where error.code != .cancelled && attempt < 20 {
+                HengeLog.log("install", "USB download interrupted (\(error.localizedDescription)); retrying its partial file")
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+        throw message("The USB download kept failing. Its partial file was kept.")
     }
 
     private func downloadOnce(_ url: URL) async throws -> URL {
@@ -239,11 +287,12 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The restore
 
-    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
+    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int, workspace: ExternalInstallWorkspace?) async throws {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
         let diskAccess = try mac.openDisk()
         ExternalDiskRuntime.retain(diskAccess)
         ExternalDiskRuntime.tune(for: mac)
+        if let workspace { ExternalDiskRuntime.retain(workspace) }
         // The restore needs 2 GB, whatever the Mac is set to use afterwards, and gets at most 4 GB: the restore system
         // caches the ~15 GB it writes, so it fills all the memory it is given, and 10 GB of a 12 GB iPhone's RAM in use
         // (it is outside Henge's footprint, so iOS does not stop it) stalls the whole phone two thirds of the way through.
@@ -252,8 +301,14 @@ final class Installer: NSObject, ObservableObject {
         let ram = GuestMemory.prepare(restoring)
         guard ram >= 2048 else { throw message("Installing needs a few more GB of free storage for the Mac's memory.") }
         setenv("HV_WRITE_CACHE", "0", 1) // the ~15 GB the restore writes goes straight to storage (host/disk.c); this process runs no other Mac
-        let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
-        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let work: URL
+        if let workspace {
+            work = try workspace.makeRestoreDirectory(for: mac.id)
+            HengeLog.log("install", "restore extraction cache is on USB")
+        } else {
+            work = mac.directory.appendingPathComponent("restore", isDirectory: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        }
         var buffer = [CChar](repeating: 0, count: 256)
         let rc = henge_vm_install(mac.rom.path, diskAccess.url.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)
@@ -261,7 +316,7 @@ final class Installer: NSObject, ObservableObject {
         while true {
             try await Task.sleep(nanoseconds: 1_000_000_000)
             if mac.externalDisk != nil {
-                do { try diskAccess.validate() }
+                do { try diskAccess.validate(); try workspace?.validate() }
                 catch {
                     henge_vm_stop()
                     throw message("External disk access was lost. The VM was asked to stop. Reconnect the drive and inspect the log; disk integrity is not guaranteed.")
@@ -285,7 +340,8 @@ final class Installer: NSObject, ObservableObject {
         Machines.shared.add(mac)
         HengeLog.log("install", "\(mac.name): restore finished, added to the Macs")
         if henge_vm_state() == 1 { henge_vm_stop() }
-        try? FileManager.default.removeItem(at: work)
+        if let workspace { try? workspace.removeRestoreDirectory(work) }
+        else { try? FileManager.default.removeItem(at: work) }
     }
 
     static func stepName(_ step: Int) -> String {

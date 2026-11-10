@@ -139,6 +139,102 @@ final class DiskAccess {
     }
 }
 
+/// Downloads and restore extraction share a deliberately owned USB cache, separate
+/// from guest disks. An existing user folder is never adopted without its marker.
+final class ExternalInstallWorkspace {
+    let scope: SecurityScopedFolder
+    let directory: URL
+    let downloads: URL
+    private let owner: Owner
+    private var restoreDirectories: Set<URL> = []
+
+    private struct Owner: Codable, Equatable {
+        let format: Int
+        let purpose: String
+        let token: UUID
+    }
+
+    init(folder: ExternalDiskFolder) throws {
+        let access = try folder.open()
+        let result: (URL, Owner) = try access.coordinate { root in
+            let directory = root.appendingPathComponent("Henge Installer", isDirectory: true)
+            let marker = directory.appendingPathComponent("owner.json")
+            if mkdir(directory.path, mode_t(0o700)) == 0 {
+                let owner = Owner(format: 1, purpose: "Henge restore cache", token: UUID())
+                try JSONEncoder().encode(owner).write(to: marker, options: .withoutOverwriting)
+                return (directory, owner)
+            }
+            guard errno == EEXIST else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            try Self.checkDirectory(directory)
+            let values = try marker.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true, (values.fileSize ?? Int.max) < 4096,
+                  let owner = try? JSONDecoder().decode(Owner.self, from: Data(contentsOf: marker)),
+                  owner.format == 1, owner.purpose == "Henge restore cache" else {
+                throw externalDiskError("The USB folder already contains an unrecognized Henge Installer folder. Choose a different parent folder; no existing files were changed.")
+            }
+            return (directory, owner)
+        }
+        scope = access
+        directory = result.0
+        owner = result.1
+        downloads = directory.appendingPathComponent("Downloads", isDirectory: true)
+        if mkdir(downloads.path, mode_t(0o700)) != 0 && errno != EEXIST {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        try Self.checkDirectory(downloads)
+    }
+
+    func validate() throws {
+        try scope.checkLocalUSB()
+        try Self.checkDirectory(directory)
+        let marker = directory.appendingPathComponent("owner.json")
+        let values = try marker.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true, (values.fileSize ?? Int.max) < 4096,
+              try JSONDecoder().decode(Owner.self, from: Data(contentsOf: marker)) == owner else {
+            throw externalDiskError("The external installer folder changed or its USB drive was disconnected.")
+        }
+        try Self.checkDirectory(downloads)
+    }
+
+    func image(id: String, source: URL) throws -> RestoreImageStore {
+        try validate()
+        guard !id.isEmpty, id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else {
+            throw externalDiskError("Invalid restore image name.")
+        }
+        return RestoreImageStore(url: downloads.appendingPathComponent("\(id).ipsw"), source: source)
+    }
+
+    func makeRestoreDirectory(for id: UUID) throws -> URL {
+        try validate()
+        let work = directory.appendingPathComponent("Restore-\(id.uuidString)", isDirectory: true)
+        guard mkdir(work.path, mode_t(0o700)) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        try JSONEncoder().encode(owner).write(to: work.appendingPathComponent("henge-owner.json"), options: .withoutOverwriting)
+        restoreDirectories.insert(work)
+        return work
+    }
+
+    func removeRestoreDirectory(_ work: URL) throws {
+        try validate()
+        guard restoreDirectories.contains(work) else { throw externalDiskError("Unknown restore folder; it was not removed.") }
+        try Self.checkDirectory(work)
+        let marker = work.appendingPathComponent("henge-owner.json")
+        let values = try marker.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true, (values.fileSize ?? Int.max) < 4096,
+              try JSONDecoder().decode(Owner.self, from: Data(contentsOf: marker)) == owner else {
+            throw externalDiskError("Restore folder ownership changed; it was not removed.")
+        }
+        try FileManager.default.removeItem(at: work)
+        restoreDirectories.remove(work)
+    }
+
+    private static func checkDirectory(_ url: URL) throws {
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw externalDiskError("An external installer path is not a regular folder.")
+        }
+    }
+}
+
 #if !HENGE_STORAGE_PROBE
 extension VirtualMac {
     func openDisk() throws -> DiskAccess {
@@ -153,7 +249,9 @@ extension VirtualMac {
 enum ExternalDiskRuntime {
     // Henge supports one native VM per process. Do not release the scope merely because the UI closes.
     private static var held: [DiskAccess] = []
+    private static var heldWorkspaces: [ExternalInstallWorkspace] = []
     static func retain(_ access: DiskAccess) { held.append(access) }
+    static func retain(_ workspace: ExternalInstallWorkspace) { heldWorkspaces.append(workspace) }
     static func tune(for mac: VirtualMac) {
         if mac.externalDisk != nil {
             setenv("HV_EXTERNAL_DISK", "1", 1)
