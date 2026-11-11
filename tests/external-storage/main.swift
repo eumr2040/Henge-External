@@ -218,4 +218,66 @@ try test("USB installs reserve internal RAM without staging the IPSW internally"
     try check(usbNeed > 64 << 30 && usbNeed < 292_000_000_000, "USB space estimate does not include staging or exceeds this drive")
     try check(InstallSpace.externalBytes(imageBytes: ipsw, haveImage: true) == usbNeed - ipsw, "completed cache not reused in estimate")
 }
-print("\(passed) storage tests passed. USB permissions, exFAT, iOS build and macOS boot are NOT covered.")
+func folderFacts(local: Bool? = nil, internalVolume: Bool? = nil, readOnly: Bool? = nil,
+                 ubiquitous: Bool? = nil, filesystemLocal: Bool? = true,
+                 filesystemReadOnly: Bool? = false, sameAsInternal: Bool? = false,
+                 directory: Bool = true, symbolicLink: Bool = false) -> ExternalFolderFacts {
+    ExternalFolderFacts(directory: directory, symbolicLink: symbolicLink, local: local,
+                        internalVolume: internalVolume, readOnly: readOnly, ubiquitous: ubiquitous,
+                        filesystemLocal: filesystemLocal, filesystemReadOnly: filesystemReadOnly,
+                        sameAsInternalVolume: sameAsInternal, filesystemType: "test")
+}
+try test("Complete NSURL metadata still accepts a writable external volume") {
+    let facts = folderFacts(local: true, internalVolume: false, readOnly: false,
+                            filesystemLocal: nil, filesystemReadOnly: nil, sameAsInternal: nil)
+    try check(facts.rejection == nil, "known external volume rejected")
+}
+try test("Unavailable iPad volume metadata uses independent local mount evidence") {
+    let facts = folderFacts()
+    try check(facts.local == nil && facts.internalVolume == nil && facts.readOnly == nil,
+              "test must represent missing NSURL values")
+    try check(facts.rejection == nil, "missing metadata was treated as an internal or read-only volume")
+}
+try test("A provider's internal staging volume cannot pass as USB") {
+    let facts = folderFacts(local: true, internalVolume: false, readOnly: false, sameAsInternal: true)
+    try check(facts.rejection != nil, "internal staged provider directory accepted")
+}
+try test("Network, cloud, read-only, internal and symlink targets stay rejected") {
+    let rejected = [folderFacts(local: false), folderFacts(ubiquitous: true),
+                    folderFacts(readOnly: true), folderFacts(filesystemReadOnly: true),
+                    folderFacts(internalVolume: true), folderFacts(filesystemLocal: false),
+                    folderFacts(directory: false), folderFacts(symbolicLink: true)]
+    for facts in rejected { try check(facts.rejection != nil, "unsafe target accepted: \(facts.diagnostic)") }
+}
+try test("Unknown volume identity is not enough to enable external mode") {
+    let allMissing = folderFacts(filesystemLocal: nil, filesystemReadOnly: nil, sameAsInternal: nil)
+    let noIdentity = folderFacts(local: true, sameAsInternal: nil)
+    try check(allMissing.rejection != nil && noIdentity.rejection != nil, "unknown storage was implicitly trusted")
+}
+try test("Real statfs facts recognize this internal test volume and its capacity") {
+    let facts = ExternalFolderFacts.inspect(root)
+    try check(facts.directory && facts.sameAsInternalVolume == true, "could not identify the real internal test volume")
+    try check(facts.rejection != nil, "actual internal volume passed the external policy")
+    try check(facts.availableBytes != nil && facts.availableBytes! >= 0, "missing real free-space measurement")
+    try check(!facts.diagnostic.isEmpty, "missing rejection diagnostics")
+}
+try test("Direct USB-style write/read probe cleans up and preserves existing files") {
+    let sentinel = root.appendingPathComponent("probe-sentinel.txt")
+    let contents = Data("KEEP THIS FILE".utf8)
+    try contents.write(to: sentinel)
+    let before = Set(try fm.contentsOfDirectory(atPath: root.path))
+    try ExternalFolderWriteProbe.verify(in: root)
+    let after = Set(try fm.contentsOfDirectory(atPath: root.path))
+    let data = try Data(contentsOf: sentinel)
+    try check(before == after && data == contents, "probe left a file or changed existing data")
+}
+try test("Write/read probe refuses a directory without write permission") {
+    let folder = root.appendingPathComponent("probe-read-only")
+    try fm.createDirectory(at: folder, withIntermediateDirectories: false)
+    try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+    defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path) }
+    try mustThrow { try ExternalFolderWriteProbe.verify(in: folder) }
+    let contents = try fm.contentsOfDirectory(atPath: folder.path)
+    try check(contents.isEmpty, "failed probe left a file")
+}
+print("\(passed) storage tests passed. Real iPad USB permissions, exFAT and macOS boot are NOT covered.")

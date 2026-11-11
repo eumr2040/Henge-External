@@ -151,8 +151,11 @@ final class Installer: NSObject, ObservableObject {
             let cachedSize = try workspace.image(id: r.id, source: r.url).completeSize
             let haveImage = Self.haveImage(r) || cachedSize != nil
             let externalNeeded = InstallSpace.externalBytes(imageBytes: r.bytes, haveImage: haveImage)
-            let values = try workspace.directory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-            guard let available = values.volumeAvailableCapacity, Int64(available) >= externalNeeded else {
+            let facts = ExternalFolderFacts.inspect(workspace.directory)
+            guard let available = facts.availableBytes else {
+                throw message("Cannot measure USB free space. Installation was not started. [\(facts.diagnostic)]")
+            }
+            guard available >= externalNeeded else {
                 throw message("External storage needs about \(ByteText.string(UInt64(externalNeeded))) free for the 64 GiB disk, restore download, extracted files and reserve.")
             }
             guard free > 0 else { throw message("Cannot measure internal free space. Installation was not started.") }

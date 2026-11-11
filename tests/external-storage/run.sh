@@ -6,7 +6,7 @@ fixture_pid=
 trap 'if [ -n "$fixture_pid" ]; then kill "$fixture_pid" 2>/dev/null || true; fi; rm -rf "$output"' EXIT
 swiftc -swift-version 5 -D HENGE_STORAGE_PROBE \
   ios/Henge/FullDiskWriter.swift ios/Henge/RestoreImageDownload.swift \
-  ios/Henge/InstallSpace.swift ios/Henge/ExternalDisk.swift \
+  ios/Henge/InstallSpace.swift ios/Henge/ExternalFolderValidation.swift ios/Henge/ExternalDisk.swift \
   tests/external-storage/main.swift -o "$output/storage-tests"
 "$output/storage-tests"
 swiftc -swift-version 5 ios/Henge/RestoreImageDownload.swift \

@@ -13,7 +13,7 @@ struct ExternalDiskFolder: Codable, Hashable {
     static func selected(_ url: URL) throws -> ExternalDiskFolder {
         let access = try SecurityScopedFolder(url)
         defer { withExtendedLifetime(access) {} }
-        try access.checkLocalUSB()
+        try access.checkLocalUSB(writeProbe: true)
         let data = try url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
         return ExternalDiskFolder(bookmark: data, name: url.lastPathComponent)
     }
@@ -23,7 +23,7 @@ struct ExternalDiskFolder: Codable, Hashable {
         let url = try URL(resolvingBookmarkData: bookmark, options: .withoutUI, relativeTo: nil, bookmarkDataIsStale: &stale)
         guard !stale else { throw externalDiskError("The external folder permission has expired. Choose the same folder again in this Mac's Storage settings.") }
         let access = try SecurityScopedFolder(url)
-        try access.checkLocalUSB()
+        try access.checkLocalUSB(writeProbe: true)
         return access
     }
 }
@@ -40,11 +40,14 @@ final class SecurityScopedFolder {
     }
     deinit { url.stopAccessingSecurityScopedResource() }
 
-    func checkLocalUSB() throws {
-        let v = try url.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey, .volumeIsInternalKey, .volumeIsReadOnlyKey])
-        guard v.isDirectory == true, v.volumeIsLocal == true,
-              v.volumeIsInternal == false, v.volumeIsReadOnly == false else {
-            throw externalDiskError("Choose a writable folder on the connected USB drive. Cloud providers and internal storage are not supported by external mode.")
+    func checkLocalUSB(writeProbe: Bool = false) throws {
+        let facts = ExternalFolderFacts.inspect(url)
+        if let reason = facts.rejection {
+            throw externalDiskError("\(reason) [\(facts.diagnostic)]")
+        }
+        if writeProbe {
+            do { try coordinate { try ExternalFolderWriteProbe.verify(in: $0) } }
+            catch { throw externalDiskError("USB folder write/read check failed: \(error.localizedDescription) [\(facts.diagnostic)]") }
         }
     }
 

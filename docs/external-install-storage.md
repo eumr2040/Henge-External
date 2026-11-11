@@ -38,3 +38,25 @@ actual loopback download/resume tests. The GitHub workflow also parses app sourc
 with the iOS SDK; the IPA build separately type-checks and links the whole app.
 These checks do not demonstrate a successful macOS boot on a 4 GB iPad, real USB
 scope behavior, cable stability or exFAT performance. Those require device testing.
+
+## Folder validation (0.2.2)
+
+The 0.2.1 folder check required every optional NSURL volume flag to be present.
+An unavailable `volumeIsInternal` or `volumeIsReadOnly` value therefore rejected a
+real USB folder before any installation began. The observed iPad rejection did
+not include those values, so this was a possible false rejection rather than a
+confirmed measurement of the user's mount.
+
+The updated policy accepts missing NSURL values only when independent evidence
+identifies a local filesystem with a nonzero ID different from the app's internal
+volume. Explicit internal, network, cloud and read-only reports remain blocked;
+an internal provider staging directory is blocked even if NSURL reports it as
+external. A uniquely named, exclusively created file verifies direct write, sync,
+seek and read access at selection and bookmark reopening. It is then removed.
+This probe does not run once per second during restore monitoring.
+
+Unknown free-space metadata also falls back to `statfs` available blocks, using
+the smaller value when both measurements exist. A failure now reports the actual
+metadata/mount classification without exposing full file paths or volume IDs.
+An invalid new selection clears the old folder so installation cannot silently
+continue on the previous disk. Real iPad folder acceptance still needs testing.

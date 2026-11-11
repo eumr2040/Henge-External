@@ -43,7 +43,10 @@ struct InstallView: View {
                 do {
                     externalFolder = try ExternalDiskFolder.selected(result.get())
                     externalError = nil
-                } catch { externalError = error.localizedDescription }
+                } catch {
+                    externalFolder = nil
+                    externalError = error.localizedDescription
+                }
             }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
