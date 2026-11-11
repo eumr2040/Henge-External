@@ -4,7 +4,12 @@ on:
   push:
     paths:
       - 'ios/Henge/ExternalDisk.swift'
+      - 'ios/Henge/ExternalFolderValidation.swift'
       - 'ios/Henge/FullDiskWriter.swift'
+      - 'ios/Henge/RestoreImageDownload.swift'
+      - 'ios/Henge/InstallSpace.swift'
+      - 'ios/Henge/Installer.swift'
+      - 'ios/Henge/InstallView.swift'
       - 'tests/external-storage/**'
       - '.github/workflows/external-storage-tests.yml'
   pull_request:
@@ -23,6 +28,8 @@ jobs:
         run: |
           xcrun --sdk iphoneos swiftc -frontend -parse \
             ios/Henge/ExternalDisk.swift ios/Henge/FullDiskWriter.swift \
+            ios/Henge/ExternalFolderValidation.swift \
+            ios/Henge/RestoreImageDownload.swift ios/Henge/InstallSpace.swift \
             ios/Henge/Installer.swift ios/Henge/InstallView.swift \
             ios/Henge/Machines.swift ios/Henge/SessionView.swift \
             ios/Henge/HomeView.swift ios/Henge/MacSettingsView.swift

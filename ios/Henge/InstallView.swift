@@ -43,7 +43,10 @@ struct InstallView: View {
                 do {
                     externalFolder = try ExternalDiskFolder.selected(result.get())
                     externalError = nil
-                } catch { externalError = error.localizedDescription }
+                } catch {
+                    externalFolder = nil
+                    externalError = error.localizedDescription
+                }
             }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
@@ -133,7 +136,7 @@ struct InstallView: View {
                 Button(externalFolder.map { "Folder: \($0.name) — choose again" } ?? "Choose folder on USB drive") { pickingExternal = true }
                 Text("A new 64 GiB disk is fully written to the chosen drive. On exFAT this uses about 69 GB immediately and may take many minutes. Keep the drive connected throughout installation and use.")
                     .font(.system(size: 13)).foregroundStyle(Desk.dim)
-                Text("The download, restore cache and temporary guest memory still use internal iPad storage. This does not confirm macOS will boot on a 4 GB iPad.")
+                Text("The macOS download and large restore cache are stored directly on USB. Guest memory scratch and small settings stay on this iPad. macOS boot on a 4 GB iPad is still unverified.")
                     .font(.system(size: 13)).foregroundStyle(Desk.dim)
                 if let externalError { Text(externalError).foregroundStyle(Desk.bad) }
             }
@@ -148,7 +151,7 @@ struct InstallView: View {
         .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld && (!useExternal || externalFolder != nil)))
         .disabled(!jitReady || Device.chipTooOld || (useExternal && externalFolder == nil))
         .padding(.top, 20)
-        Text(Device.chipTooOld ? Device.chipTooOldText : jitReady ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release, external: useExternal, ramMB: ramGB * 1024)))) free internally\(useExternal ? ", plus 66 GiB on USB" : "")."
+        Text(Device.chipTooOld ? Device.chipTooOldText : jitReady ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release, external: useExternal, ramMB: ramGB * 1024)))) free internally\(useExternal ? ", plus about \(ByteText.string(UInt64(Installer.externalSpaceNeeded(release)))) on USB (estimated)" : "")."
                                 : JITBootstrap.lastFailure ?? "Turn on JIT first. \(jit.automaticDescription)")
             .font(.system(size: 13))
             .foregroundStyle(Desk.dim)
